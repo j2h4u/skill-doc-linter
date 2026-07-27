@@ -9,6 +9,7 @@ import re
 import sys
 from collections import defaultdict, deque
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import unquote, urlparse
 
 DEFAULT_SCAN_ROOT = Path.cwd()
@@ -50,6 +51,19 @@ FILE_LIKE_AT_EXTENSIONS = {
 }
 
 
+class Graph(NamedTuple):
+    edges: dict[Path, set[Path]]
+    incoming: dict[Path, set[Path]]
+    broken: list[tuple[Path, str, str]]
+
+
+class ProblemForest(NamedTuple):
+    standalone_roots: list[Path]
+    tree_roots: list[Path]
+    unrooted_pages: list[Path]
+    children_by_parent: dict[Path, list[Path]]
+
+
 def markdown_files(scan_root: Path) -> set[Path]:
     files: set[Path] = set()
     for path in scan_root.rglob("*.md"):
@@ -86,36 +100,60 @@ def should_validate_at_reference(target: str, resolved: Path) -> bool:
 def iter_frontmatter_targets(source: Path, text: str) -> list[str]:
     """Return recognized file references from simple YAML frontmatter fields."""
 
-    if not text.startswith("---\n"):
-        return []
-
-    end = text.find("\n---", 4)
-    if end == -1:
+    frontmatter = frontmatter_block(text)
+    if frontmatter is None:
         return []
 
     targets: list[str] = []
     current_field: str | None = None
-    for raw_line in text[4:end].splitlines():
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
-            continue
-
-        if not raw_line.startswith((" ", "\t")):
-            key, _, remainder = raw_line.partition(":")
-            current_field = key.strip()
-            if current_field in FRONTMATTER_FILE_REF_FIELDS and remainder.strip():
-                targets.extend(frontmatter_value_targets(source, current_field, current_field, remainder.strip()))
-            continue
-
-        if current_field not in FRONTMATTER_FILE_REF_FIELDS:
-            continue
-
-        key, separator, remainder = raw_line.strip().partition(":")
-        if separator:
-            targets.extend(frontmatter_value_targets(source, current_field, key.strip(), remainder.strip()))
-        elif raw_line.strip().startswith("- "):
-            targets.extend(frontmatter_value_targets(source, current_field, "", raw_line.strip()[2:].strip()))
+    for raw_line in frontmatter.splitlines():
+        current_field, line_targets = frontmatter_line_targets(source, raw_line, current_field)
+        targets.extend(line_targets)
 
     return targets
+
+
+def frontmatter_block(text: str) -> str | None:
+    if not text.startswith("---\n"):
+        return None
+
+    end = text.find("\n---", 4)
+    if end == -1:
+        return None
+    return text[4:end]
+
+
+def frontmatter_line_targets(
+    source: Path,
+    raw_line: str,
+    current_field: str | None,
+) -> tuple[str | None, list[str]]:
+    stripped = raw_line.strip()
+    if not stripped or raw_line.lstrip().startswith("#"):
+        return current_field, []
+    if raw_line.startswith((" ", "\t")):
+        return current_field, indented_frontmatter_targets(source, stripped, current_field)
+    return top_level_frontmatter_targets(source, raw_line)
+
+
+def top_level_frontmatter_targets(source: Path, raw_line: str) -> tuple[str, list[str]]:
+    key, _, remainder = raw_line.partition(":")
+    field = key.strip()
+    if field in FRONTMATTER_FILE_REF_FIELDS and remainder.strip():
+        return field, frontmatter_value_targets(source, field, field, remainder.strip())
+    return field, []
+
+
+def indented_frontmatter_targets(source: Path, stripped: str, current_field: str | None) -> list[str]:
+    if current_field not in FRONTMATTER_FILE_REF_FIELDS:
+        return []
+
+    key, separator, remainder = stripped.partition(":")
+    if separator:
+        return frontmatter_value_targets(source, current_field, key.strip(), remainder.strip())
+    if stripped.startswith("- "):
+        return frontmatter_value_targets(source, current_field, "", stripped[2:].strip())
+    return []
 
 
 def frontmatter_value_targets(source: Path, field: str, key: str, value: str) -> list[str]:
@@ -185,48 +223,103 @@ def lint(entrypoints: list[Path], scan_root: Path) -> int:
     scan_root = scan_root.resolve()
     entrypoints = [entrypoint.resolve() for entrypoint in entrypoints]
     files = markdown_files(scan_root)
+    entrypoints = entrypoints or auto_entrypoints(scan_root, files)
 
-    if not entrypoints:
-        entrypoints = auto_entrypoints(scan_root, files)
+    if not validate_entrypoints(entrypoints, files, scan_root):
+        return 1
 
+    graph = build_graph(files, scan_root)
+    reachable = reachable_files(entrypoints, graph.edges)
+    unreachable = sorted(files - reachable)
+    entrypoints_text = entrypoint_label(entrypoints, scan_root)
+
+    print_broken_references(graph.broken, scan_root)
+    if unreachable:
+        print_unreachable_suggestions(unreachable, graph.edges, graph.incoming, entrypoints_text, scan_root)
+
+    if graph.broken or unreachable:
+        return 1
+
+    print(f"Documentation graph OK: {len(files)} markdown files reachable from {entrypoints_text}.")
+    return 0
+
+
+def validate_entrypoints(entrypoints: list[Path], files: set[Path], scan_root: Path) -> bool:
     if not entrypoints:
         print(f"no graph entrypoints found under scan root: {scan_root}", file=sys.stderr)
-        return 1
+        return False
 
     missing_entrypoints = [entrypoint for entrypoint in entrypoints if entrypoint not in files]
-    if missing_entrypoints:
-        print("graph entrypoints missing or outside scan root:", file=sys.stderr)
-        for entrypoint in missing_entrypoints:
-            print(f"  {entrypoint}", file=sys.stderr)
-        return 1
+    if not missing_entrypoints:
+        return True
 
+    print("graph entrypoints missing or outside scan root:", file=sys.stderr)
+    for entrypoint in missing_entrypoints:
+        print(f"  {entrypoint}", file=sys.stderr)
+    return False
+
+
+def build_graph(files: set[Path], scan_root: Path) -> Graph:
     edges: dict[Path, set[Path]] = defaultdict(set)
     incoming: dict[Path, set[Path]] = defaultdict(set)
     broken: list[tuple[Path, str, str]] = []
 
     for source in sorted(files):
-        text = source.read_text(encoding="utf-8")
-        link_text = strip_markdown_code(text)
-        targets = [
-            *[("markdown", target) for target in iter_link_targets(link_text)],
-            *[("@", target) for target in iter_at_reference_targets(link_text)],
-            *[("frontmatter", target) for target in iter_frontmatter_targets(source, text)],
-        ]
-        for kind, target in targets:
-            if is_ignored(target):
-                continue
-            resolved = resolve_local_target(source, target, scan_root)
-            if kind == "@" and not should_validate_at_reference(target, resolved):
-                continue
-            if kind == "markdown" and resolved.suffix.lower() != ".md":
-                continue
-            if not resolved.exists():
-                broken.append((source, kind, target))
-                continue
-            if resolved.is_file() and resolved.suffix.lower() == ".md" and resolved in files:
-                edges[source].add(resolved)
-                incoming[resolved].add(source)
+        add_source_edges(source, files, scan_root, edges, incoming, broken)
 
+    return Graph(edges, incoming, broken)
+
+
+def add_source_edges(
+    source: Path,
+    files: set[Path],
+    scan_root: Path,
+    edges: dict[Path, set[Path]],
+    incoming: dict[Path, set[Path]],
+    broken: list[tuple[Path, str, str]],
+) -> None:
+    text = source.read_text(encoding="utf-8")
+    link_text = strip_markdown_code(text)
+    targets = [
+        *[("markdown", target) for target in iter_link_targets(link_text)],
+        *[("@", target) for target in iter_at_reference_targets(link_text)],
+        *[("frontmatter", target) for target in iter_frontmatter_targets(source, text)],
+    ]
+    for kind, target in targets:
+        add_target_edge(source, kind, target, files, scan_root, edges, incoming, broken)
+
+
+def add_target_edge(
+    source: Path,
+    kind: str,
+    target: str,
+    files: set[Path],
+    scan_root: Path,
+    edges: dict[Path, set[Path]],
+    incoming: dict[Path, set[Path]],
+    broken: list[tuple[Path, str, str]],
+) -> None:
+    if is_ignored(target):
+        return
+
+    resolved = resolve_local_target(source, target, scan_root)
+    if should_skip_target(kind, target, resolved):
+        return
+    if not resolved.exists():
+        broken.append((source, kind, target))
+        return
+    if resolved.is_file() and resolved.suffix.lower() == ".md" and resolved in files:
+        edges[source].add(resolved)
+        incoming[resolved].add(source)
+
+
+def should_skip_target(kind: str, target: str, resolved: Path) -> bool:
+    if kind == "@" and not should_validate_at_reference(target, resolved):
+        return True
+    return kind == "markdown" and resolved.suffix.lower() != ".md"
+
+
+def reachable_files(entrypoints: list[Path], edges: dict[Path, set[Path]]) -> set[Path]:
     reachable: set[Path] = set()
     queue: deque[Path] = deque(entrypoints)
     while queue:
@@ -235,25 +328,16 @@ def lint(entrypoints: list[Path], scan_root: Path) -> int:
             continue
         reachable.add(current)
         queue.extend(sorted(edges[current] - reachable))
+    return reachable
 
-    unreachable = sorted(files - reachable)
-    entrypoint_set = set(entrypoints)
-    no_incoming = sorted(path for path in files if path not in entrypoint_set and not incoming[path])
-    entrypoints_text = entrypoint_label(entrypoints, scan_root)
 
-    if broken:
-        print("Fix broken local references:")
-        for source, kind, target in broken:
-            print(f"  {display(source, scan_root)} -> {kind}:{target}")
+def print_broken_references(broken: list[tuple[Path, str, str]], scan_root: Path) -> None:
+    if not broken:
+        return
 
-    if unreachable:
-        print_unreachable_suggestions(unreachable, edges, incoming, entrypoints_text, scan_root)
-
-    if broken or unreachable or no_incoming:
-        return 1
-
-    print(f"Documentation graph OK: {len(files)} markdown files reachable from {entrypoints_text}.")
-    return 0
+    print("Fix broken local references:")
+    for source, kind, target in broken:
+        print(f"  {display(source, scan_root)} -> {kind}:{target}")
 
 
 def print_unreachable_suggestions(
@@ -263,45 +347,101 @@ def print_unreachable_suggestions(
     entrypoints_text: str,
     scan_root: Path,
 ) -> None:
-    unreachable_set = set(unreachable)
-    children_by_parent = {
-        path: sorted(child for child in edges[path] if child in unreachable_set)
-        for path in unreachable
-    }
-    incoming_from_unreachable = {
-        path: {parent for parent in incoming[path] if parent in unreachable_set}
-        for path in unreachable
-    }
-    roots = sorted(path for path in unreachable if not incoming_from_unreachable[path])
-    standalone_roots = sorted(path for path in roots if not children_by_parent[path])
-    tree_roots = sorted(path for path in roots if children_by_parent[path])
+    forest = problem_forest(unreachable, edges, incoming)
     printed_in_trees: set[Path] = set()
 
     print("Suggested documentation fixes:")
-    if tree_roots:
-        print(
-            f"  Link these orphan tree roots into an entrypoint ({entrypoints_text}); "
-            "their child pages shown below will become reachable too:"
-        )
-        for root in tree_roots:
-            print_tree(root, children_by_parent, scan_root, printed_in_trees)
+    print_tree_root_suggestions(forest, entrypoints_text, scan_root, printed_in_trees)
+    print_standalone_suggestions(forest, entrypoints_text, scan_root)
+    print_unrooted_suggestions(forest, printed_in_trees, entrypoints_text, scan_root)
 
-    if standalone_roots:
-        print(
-            f"  Decide where these standalone orphan pages belong, then link them from "
-            f"an entrypoint ({entrypoints_text}) or another reachable page; archive/remove them if obsolete:"
-        )
-        for path in standalone_roots:
-            print(f"    ? ── {display(path, scan_root)}")
 
-    unprinted = sorted(unreachable_set - set(standalone_roots) - printed_in_trees)
-    if unprinted:
-        print(
-            f"  Review these unreachable pages with no clear root; "
-            f"link one page from each cluster into an entrypoint ({entrypoints_text}):"
-        )
-        for path in unprinted:
-            print(f"    ? ── {display(path, scan_root)}")
+def problem_forest(
+    unreachable: list[Path],
+    edges: dict[Path, set[Path]],
+    incoming: dict[Path, set[Path]],
+) -> ProblemForest:
+    unreachable_set = set(unreachable)
+    children_by_parent = unreachable_children_by_parent(unreachable, edges, unreachable_set)
+    incoming_from_unreachable = unreachable_incoming_by_page(unreachable, incoming, unreachable_set)
+    roots = sorted(path for path in unreachable if not incoming_from_unreachable[path])
+    standalone_roots = sorted(path for path in roots if not children_by_parent[path])
+    tree_roots = sorted(path for path in roots if children_by_parent[path])
+    unrooted_pages = sorted(unreachable_set - set(standalone_roots))
+    return ProblemForest(standalone_roots, tree_roots, unrooted_pages, children_by_parent)
+
+
+def unreachable_children_by_parent(
+    unreachable: list[Path],
+    edges: dict[Path, set[Path]],
+    unreachable_set: set[Path],
+) -> dict[Path, list[Path]]:
+    return {
+        path: sorted(child for child in edges[path] if child in unreachable_set)
+        for path in unreachable
+    }
+
+
+def unreachable_incoming_by_page(
+    unreachable: list[Path],
+    incoming: dict[Path, set[Path]],
+    unreachable_set: set[Path],
+) -> dict[Path, set[Path]]:
+    return {
+        path: {parent for parent in incoming[path] if parent in unreachable_set}
+        for path in unreachable
+    }
+
+
+def print_tree_root_suggestions(
+    forest: ProblemForest,
+    entrypoints_text: str,
+    scan_root: Path,
+    printed_in_trees: set[Path],
+) -> None:
+    if not forest.tree_roots:
+        return
+
+    print(
+        f"  Link these orphan tree roots into an entrypoint ({entrypoints_text}); "
+        "their child pages shown below will become reachable too:"
+    )
+    for root in forest.tree_roots:
+        print_tree(root, forest.children_by_parent, scan_root, printed_in_trees)
+
+
+def print_standalone_suggestions(
+    forest: ProblemForest,
+    entrypoints_text: str,
+    scan_root: Path,
+) -> None:
+    if not forest.standalone_roots:
+        return
+
+    print(
+        f"  Decide where these standalone orphan pages belong, then link them from "
+        f"an entrypoint ({entrypoints_text}) or another reachable page; archive/remove them if obsolete:"
+    )
+    for path in forest.standalone_roots:
+        print(f"    ? ── {display(path, scan_root)}")
+
+
+def print_unrooted_suggestions(
+    forest: ProblemForest,
+    printed_in_trees: set[Path],
+    entrypoints_text: str,
+    scan_root: Path,
+) -> None:
+    unprinted = sorted(set(forest.unrooted_pages) - printed_in_trees)
+    if not unprinted:
+        return
+
+    print(
+        f"  Review these unreachable pages with no clear root; "
+        f"link one page from each cluster into an entrypoint ({entrypoints_text}):"
+    )
+    for path in unprinted:
+        print(f"    ? ── {display(path, scan_root)}")
 
 
 def print_tree(
