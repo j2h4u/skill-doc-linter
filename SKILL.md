@@ -1,6 +1,7 @@
 ---
 name: doc-linter
 description: Check AI-facing technical documentation for disconnected Markdown graph nodes. Use when maintaining AGENTS.md, CLAUDE.md, SKILL.md, README.md, generated docs, runbooks, or skill references, and you need to verify that local Markdown files are reachable from known entrypoints instead of becoming orphaned context.
+license: LICENSE.md
 ---
 
 # Documentation Graph Linting

@@ -1,27 +1,64 @@
-# skill-doc-linter
+# Documentation Graph Linter
 
-**A small agent skill for finding disconnected Markdown documentation.**
+A small agent skill and deterministic command-line check for finding disconnected
+Markdown documentation. It helps keep agent-maintained notes, runbooks, and
+skill references discoverable from documentation entrypoints.
 
-AI-generated and agent-maintained documentation tends to grow sideways: new notes, runbooks, and skill references appear, but they are not always linked from `AGENTS.md`, `README.md`, `SKILL.md`, or `CLAUDE.md`. Those orphan files become invisible to future agents even when the information is still useful.
+## What it does
 
-This skill packages a deterministic graph check for that problem. It scans local Markdown references, Claude-style `@path` references, and selected skill frontmatter links, then reports the smallest disconnected problem graph as actionable terminal trees.
+The bundled [script](scripts/lint_doc_graph.py) scans local Markdown links,
+Claude-style `@path` references, and selected skill frontmatter links. It
+reports disconnected documentation as actionable terminal trees. The
+[skill workflow](SKILL.md) explains how to choose entrypoints and interpret
+results.
 
-## Usage
+Run the script from the repository or documentation root:
 
-```bash
+```sh
 python3 scripts/lint_doc_graph.py --scan-root .
 ```
 
-Strict single-entrypoint mode:
+To check reachability from one explicit entrypoint instead:
 
-```bash
+```sh
 python3 scripts/lint_doc_graph.py AGENTS.md --scan-root .
 ```
 
-## Skill
+The command checks documentation connections; review findings in context
+before changing or deleting documents.
 
-Agents should read [SKILL.md](SKILL.md) for the workflow and use [scripts/lint_doc_graph.py](scripts/lint_doc_graph.py) for the actual check.
+## Install
+
+Clone the full repository into the agent skills directory:
+
+```sh
+mkdir -p ~/.agents/skills
+git clone https://github.com/j2h4u/skill-doc-linter.git ~/.agents/skills/doc-linter
+```
+
+If the destination already exists, inspect it first; do not overwrite it. Reload
+the skill according to your agent host's instructions. The script remains
+available inside the clone for direct command-line use.
+
+## Update
+
+```sh
+git -C ~/.agents/skills/doc-linter pull --ff-only
+```
+
+## Use
+
+Ask your agent to check whether documentation is reachable, or invoke the
+skill by name:
+
+```text
+$doc-linter Check the documentation graph for this repository.
+```
+
+For a direct check, use the script commands above from the checkout, adjusting
+the entrypoint and scan root to the documentation being examined.
 
 ## License
 
-No license has been selected yet.
+[PolyForm Noncommercial 1.0.0](LICENSE.md) permits use under its stated terms.
+For commercial use, request written permission from the copyright holder.
